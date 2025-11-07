@@ -1,0 +1,303 @@
+name: Smart Issue Analyzer (Improved)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  analyze-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Analyze issue with parallel LLM calls
+        uses: actions/github-script@v6
+        env:
+          MODELS_PAT: ${{ secrets.MODELS_PAT }}
+        with:
+          script: |
+            const startTime = Date.now();
+            console.log('=== Starting Issue Analysis ===');
+            console.log('Issue #', context.payload.issue.number);
+            console.log('Title:', context.payload.issue.title);
+            
+            const issue = context.payload.issue;
+            
+            // Fetch all issues
+            console.log('\n[1/6] Fetching existing issues...');
+            const fetchStart = Date.now();
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              per_page: 100
+            });
+            console.log(`Fetched ${issues.length} issues in ${Date.now() - fetchStart}ms`);
+            
+            const allIssuesText = issues.filter(i => i.number !== issue.number)
+              .map(i => `Issue #${i.number} [${i.state}]: ${i.title} - ${i.body?.substring(0,150) || 'No description'}`)
+              .join('\n');
+            
+            // Helper function for LLM calls
+            async function callLLM(systemPrompt, userPrompt, maxTokens = 300) {
+              const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${process.env.MODELS_PAT}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o-mini',
+                  messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                  ],
+                  max_tokens: maxTokens,
+                  temperature: 0.3
+                })
+              });
+              
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`LLM call failed: ${response.status} - ${errorText}`);
+              }
+              
+              const result = await response.json();
+              return result.choices[0].message.content.trim();
+            }
+            
+            // Parallel LLM calls
+            console.log('\n[2/6] Running parallel LLM analysis...');
+            const llmStart = Date.now();
+            
+            const [duplicateAnalysis, classificationAnalysis, contextAnalysis] = await Promise.all([
+              // Call 1: Duplicate & Similar Issues Detection
+              callLLM(
+                'You are a duplicate issue detector. Analyze if the new issue duplicates or relates to existing issues.',
+                `New issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nExisting issues:\n${allIssuesText}\n\nRespond in JSON:\n{\n  "duplicate": "#123 or null",\n  "similar": ["#124", "#125"] or [],\n  "historicalMatch": "#125 or null",\n  "mergeProposal": "text or null"\n}`,
+                250
+              ).then(resp => {
+                console.log('✓ Duplicate analysis completed');
+                return resp;
+              }).catch(e => {
+                console.log('✗ Duplicate analysis failed:', e.message);
+                return '{"duplicate": null, "similar": [], "historicalMatch": null, "mergeProposal": null}';
+              }),
+              
+              // Call 2: Classification (labels, priority, size, type)
+              callLLM(
+                'You are an issue classifier. Categorize issues by type, priority, size, and topics.',
+                `Classify this issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nRespond in JSON:\n{\n  "labels": ["bug", "feature", "enhancement", "documentation", "performance", "security"] or [],\n  "priority": "P0/P1/P2/P3",\n  "size": "XS/S/M/L/XL",\n  "type": "bug/feature/task/documentation",\n  "assignSuggestion": "username or team or null"\n}`,
+                200
+              ).then(resp => {
+                console.log('✓ Classification completed');
+                return resp;
+              }).catch(e => {
+                console.log('✗ Classification failed:', e.message);
+                return '{"labels": [], "priority": "P2", "size": "M", "type": "task", "assignSuggestion": null}';
+              }),
+              
+              // Call 3: Context Analysis (sentiment, missing info, epic detection, dependencies)
+              callLLM(
+                'You are an issue context analyzer. Detect sentiment, missing information, complexity, and dependencies.',
+                `Analyze this issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nExisting issues:\n${allIssuesText}\n\nRespond in JSON:\n{\n  "sentiment": "positive/neutral/frustrated/angry",\n  "missingInfo": ["repro steps", "logs"] or [],\n  "isEpic": true/false,\n  "subIssueSuggestions": ["task 1", "task 2"] or [],\n  "dependencies": {"blocks": [], "blockedBy": []} or null,\n  "reasoning": "brief explanation"\n}`,
+                300
+              ).then(resp => {
+                console.log('✓ Context analysis completed');
+                return resp;
+              }).catch(e => {
+                console.log('✗ Context analysis failed:', e.message);
+                return '{"sentiment": "neutral", "missingInfo": [], "isEpic": false, "subIssueSuggestions": [], "dependencies": null, "reasoning": "Analysis failed"}';
+              })
+            ]);
+            
+            console.log(`All LLM calls completed in ${Date.now() - llmStart}ms`);
+            
+            // Parse responses
+            console.log('\n[3/6] Parsing LLM responses...');
+            let dup, classify, context;
+            try {
+              dup = JSON.parse(duplicateAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
+              classify = JSON.parse(classificationAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
+              context = JSON.parse(contextAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
+              console.log('✓ All responses parsed successfully');
+            } catch (e) {
+              console.log('✗ Parse error:', e.message);
+              console.log('Duplicate response:', duplicateAnalysis);
+              console.log('Classify response:', classificationAnalysis);
+              console.log('Context response:', contextAnalysis);
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: '⚠️ Auto-analysis encountered an error parsing LLM responses. Manual review recommended.'
+              });
+              return;
+            }
+            
+            console.log('Parsed duplicate:', JSON.stringify(dup, null, 2));
+            console.log('Parsed classify:', JSON.stringify(classify, null, 2));
+            console.log('Parsed context:', JSON.stringify(context, null, 2));
+            
+            // Build labels
+            console.log('\n[4/6] Applying labels...');
+            const labelsToAdd = [];
+            if (classify.labels?.length > 0) labelsToAdd.push(...classify.labels);
+            if (classify.priority) labelsToAdd.push(classify.priority);
+            if (classify.size) labelsToAdd.push(`size:${classify.size}`);
+            if (classify.type) labelsToAdd.push(`type:${classify.type}`);
+            if (context.sentiment === 'frustrated' || context.sentiment === 'angry') {
+              labelsToAdd.push('needs-attention');
+            }
+            
+            console.log('Labels to add:', labelsToAdd);
+            
+            // Handle duplicate
+            if (dup.duplicate && dup.duplicate !== 'null' && dup.duplicate.includes('#')) {
+              const dupMatch = dup.duplicate.match(/#(\d+)/);
+              if (dupMatch) {
+                const dupNumber = dupMatch[1];
+                console.log(`\n[DUPLICATE] Closing as duplicate of #${dupNumber}`);
+                labelsToAdd.push('duplicate');
+                
+                try {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                    labels: labelsToAdd
+                  });
+                  console.log('✓ Issue closed and labeled');
+                } catch (e) {
+                  console.log('✗ Failed to close issue:', e.message);
+                }
+                
+                let dupComment = `🤖 **Auto-Analysis: Duplicate Detected**\n\n**Duplicate of:** #${dupNumber}\n\n`;
+                if (dup.mergeProposal) {
+                  dupComment += `**Merge Proposal:** ${dup.mergeProposal}\n\n`;
+                }
+                dupComment += `**Reasoning:** ${context.reasoning || 'Detected as duplicate'}`;
+                
+                try {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: dupComment
+                  });
+                  console.log('✓ Duplicate comment posted');
+                } catch (e) {
+                  console.log('✗ Failed to post comment:', e.message);
+                }
+                
+                console.log(`\nTotal execution time: ${Date.now() - startTime}ms`);
+                return;
+              }
+            }
+            
+            // Not a duplicate - apply labels
+            console.log('\n[5/6] Adding labels to issue...');
+            if (labelsToAdd.length > 0) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: labelsToAdd
+                });
+                console.log(`✓ Added ${labelsToAdd.length} labels`);
+              } catch (e) {
+                console.log('✗ Failed to add labels:', e.message);
+              }
+            }
+            
+            // Auto-assign
+            if (classify.assignSuggestion && !classify.assignSuggestion.includes('/') && !classify.assignSuggestion.includes(' ')) {
+              console.log(`Attempting to assign to: ${classify.assignSuggestion}`);
+              try {
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  assignees: [classify.assignSuggestion]
+                });
+                console.log(`✓ Assigned to @${classify.assignSuggestion}`);
+              } catch (e) {
+                console.log(`✗ Could not assign to @${classify.assignSuggestion}:`, e.message);
+              }
+            }
+            
+            // Build comprehensive comment
+            console.log('\n[6/6] Building analysis comment...');
+            let commentBody = '🤖 **Comprehensive Auto-Analysis**\n\n';
+            
+            if (classify.priority || classify.size || classify.type) {
+              commentBody += '### 📊 Triage Information\n';
+              if (classify.priority) {
+                const emoji = classify.priority === 'P0' ? '🔴' : classify.priority === 'P1' ? '🟠' : classify.priority === 'P2' ? '🟡' : '🟢';
+                commentBody += `- **Priority:** ${emoji} ${classify.priority}\n`;
+              }
+              if (classify.size) commentBody += `- **Size Estimate:** ${classify.size}\n`;
+              if (classify.type) commentBody += `- **Type:** ${classify.type}\n`;
+              commentBody += '\n';
+            }
+            
+            if (classify.assignSuggestion) {
+              commentBody += `### 👤 Assignment Suggestion\n`;
+              const suggestion = classify.assignSuggestion.includes('/') ? classify.assignSuggestion : `@${classify.assignSuggestion}`;
+              commentBody += `Recommended: ${suggestion}\n\n`;
+            }
+            
+            if (dup.similar?.length > 0) {
+              commentBody += `### 🔗 Related Issues\n${dup.similar.join(', ')}\n\n`;
+            }
+            
+            if (dup.historicalMatch && dup.historicalMatch !== 'null') {
+              commentBody += `### 📚 Historical Reference\nSimilar issue found: ${dup.historicalMatch}\n\n`;
+            }
+            
+            if (context.dependencies?.blocks?.length > 0 || context.dependencies?.blockedBy?.length > 0) {
+              commentBody += `### ⛓️ Dependencies\n`;
+              if (context.dependencies.blocks?.length > 0) commentBody += `- **Blocks:** ${context.dependencies.blocks.join(', ')}\n`;
+              if (context.dependencies.blockedBy?.length > 0) commentBody += `- **Blocked by:** ${context.dependencies.blockedBy.join(', ')}\n`;
+              commentBody += '\n';
+            }
+            
+            if (context.missingInfo?.length > 0) {
+              commentBody += `### ⚠️ Missing Information\nPlease provide:\n`;
+              context.missingInfo.forEach(info => commentBody += `- ${info}\n`);
+              commentBody += '\n';
+            }
+            
+            if (context.sentiment === 'frustrated' || context.sentiment === 'angry') {
+              commentBody += `### 🚨 Attention Required\nUser sentiment detected as **${context.sentiment}** - prioritize response!\n\n`;
+            }
+            
+            if (context.isEpic && context.subIssueSuggestions?.length > 0) {
+              commentBody += `### 📋 Epic Breakdown Suggestion\nThis issue appears large. Consider breaking it into:\n`;
+              context.subIssueSuggestions.forEach((sub, i) => commentBody += `${i+1}. ${sub}\n`);
+              commentBody += '\n';
+            }
+            
+            if (context.reasoning) {
+              commentBody += `### 💡 Analysis\n${context.reasoning}\n\n`;
+            }
+            
+            commentBody += `---\n*Analysis completed in ${Date.now() - startTime}ms*`;
+            
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: commentBody
+              });
+              console.log('✓ Analysis comment posted');
+            } catch (e) {
+              console.log('✗ Failed to post comment:', e.message);
+            }
+            
+            console.log(`\n=== Analysis Complete (${Date.now() - startTime}ms) ===`);
