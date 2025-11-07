@@ -54,8 +54,11 @@ jobs:
             const llmResponse = result.choices[0].message.content.trim();
             console.log('LLM Answer:', llmResponse);
             
-            if (llmResponse.startsWith('#')) {
-              const dupNumber = llmResponse.match(/#(\d+)/)[1];
+            // Check if LLM found a duplicate (extract issue number)
+            const match = llmResponse.match(/#(\d+)/);
+            if (match) {
+              const dupNumber = match[1];
+              console.log('Duplicate detected:', dupNumber);
               // Close the issue, add label, comment
               await github.rest.issues.update({
                 owner: context.repo.owner,
@@ -70,4 +73,6 @@ jobs:
                 issue_number: issue.number,
                 body: `This issue has been closed as a duplicate of #${dupNumber}.`
               });
+            } else {
+              console.log('No duplicate found');
             }
