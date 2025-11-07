@@ -44,12 +44,15 @@ jobs:
             });
             
             if (!response.ok) {
-              console.log('LLM call failed:', response.status);
+              const errorText = await response.text();
+              console.log('LLM call failed:', response.status, errorText);
               return;
             }
             
             const result = await response.json();
+            console.log('LLM Response:', JSON.stringify(result, null, 2));
             const llmResponse = result.choices[0].message.content.trim();
+            console.log('LLM Answer:', llmResponse);
             
             if (llmResponse.startsWith('#')) {
               const dupNumber = llmResponse.match(/#(\d+)/)[1];
