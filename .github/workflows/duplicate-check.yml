@@ -1,4 +1,4 @@
-name: Check for Duplicate Issues
+name: Smart Issue Analyzer
 
 on:
   issues:
@@ -8,10 +8,10 @@ permissions:
   issues: write
 
 jobs:
-  check-duplicates:
+  analyze-issue:
     runs-on: ubuntu-latest
     steps:
-      - name: Check for duplicates with LLM
+      - name: Analyze issue with LLM
         uses: actions/github-script@v6
         env:
           MODELS_PAT: ${{ secrets.MODELS_PAT }}
@@ -27,7 +27,7 @@ jobs:
             
             // Prepare prompt for LLM - include all issues (open and closed)
             const allIssuesText = issues.filter(i => i.number !== issue.number).map(i => `Issue #${i.number} [${i.state}]: ${i.title} - ${i.body?.substring(0,200) || 'No description'}`).join('\n\n');
-            const prompt = `You are a duplicate issue detector. Compare the new issue below with all existing issues.\n\nNew issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nExisting issues:\n${allIssuesText}\n\nTask: Is this new issue a duplicate or near-duplicate of any existing issue (open or closed)?\nIf YES: Reply ONLY with the issue number in format "#123"\nIf NO: Reply ONLY with "No duplicate"\n\nYour answer:`;
+            const prompt = `You are an intelligent issue analyzer. Analyze the new issue below and provide structured output.\n\nNew issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nExisting issues:\n${allIssuesText}\n\nAnalyze and respond in JSON format:\n{\n  "duplicate": "#123 or null if not a duplicate",\n  "similar": ["#124", "#125"],\n  "labels": ["bug", "feature", "documentation"],\n  "priority": "P0/P1/P2/P3",\n  "reasoning": "brief explanation"\n}\n\nRespond ONLY with valid JSON:`;
             
             // Call GitHub Models API (GPT-4o-mini)
             const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
@@ -39,7 +39,8 @@ jobs:
               body: JSON.stringify({
                 model: 'gpt-4o-mini',
                 messages: [{ role: 'user', content: prompt }],
-                max_tokens: 100
+                max_tokens: 300,
+                temperature: 0.3
               })
             });
             
@@ -54,25 +55,82 @@ jobs:
             const llmResponse = result.choices[0].message.content.trim();
             console.log('LLM Answer:', llmResponse);
             
-            // Check if LLM found a duplicate (extract issue number)
-            const match = llmResponse.match(/#(\d+)/);
-            if (match) {
-              const dupNumber = match[1];
-              console.log('Duplicate detected:', dupNumber);
-              // Close the issue, add label, comment
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                state: 'closed',
-                labels: ['duplicate']
-              });
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                body: `This issue has been closed as a duplicate of #${dupNumber}.`
-              });
-            } else {
-              console.log('No duplicate found');
+            // Parse JSON response
+            let analysis;
+            try {
+              // Extract JSON from response (in case LLM adds markdown code blocks)
+              const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
+              analysis = JSON.parse(jsonMatch ? jsonMatch[0] : llmResponse);
+            } catch (e) {
+              console.log('Failed to parse JSON:', e.message);
+              return;
             }
+            
+            console.log('Parsed analysis:', JSON.stringify(analysis, null, 2));
+            
+            // Apply labels
+            const labelsToAdd = [];
+            if (analysis.labels && analysis.labels.length > 0) {
+              labelsToAdd.push(...analysis.labels);
+            }
+            if (analysis.priority) {
+              labelsToAdd.push(analysis.priority);
+            }
+            
+            // Handle duplicate
+            if (analysis.duplicate && analysis.duplicate !== 'null' && analysis.duplicate.includes('#')) {
+              const dupMatch = analysis.duplicate.match(/#(\d+)/);
+              if (dupMatch) {
+                const dupNumber = dupMatch[1];
+                console.log('Duplicate detected:', dupNumber);
+                labelsToAdd.push('duplicate');
+                
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  labels: labelsToAdd
+                });
+                
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `🤖 **Auto-Analysis**\n\n**Duplicate of:** #${dupNumber}\n\n**Reasoning:** ${analysis.reasoning}`
+                });
+                return;
+              }
+            }
+            
+            // Not a duplicate - add labels and comment with analysis
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: labelsToAdd
+              });
+            }
+            
+            // Build analysis comment
+            let commentBody = '🤖 **Auto-Analysis**\n\n';
+            if (analysis.priority) {
+              commentBody += `**Priority:** ${analysis.priority}\n`;
+            }
+            if (analysis.labels && analysis.labels.length > 0) {
+              commentBody += `**Suggested Labels:** ${analysis.labels.join(', ')}\n`;
+            }
+            if (analysis.similar && analysis.similar.length > 0) {
+              commentBody += `**Similar Issues:** ${analysis.similar.join(', ')}\n`;
+            }
+            if (analysis.reasoning) {
+              commentBody += `\n**Analysis:** ${analysis.reasoning}`;
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: commentBody
+            });
