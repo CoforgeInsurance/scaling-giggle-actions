@@ -71,7 +71,7 @@ jobs:
             console.log('\n[2/6] Running parallel LLM analysis...');
             const llmStart = Date.now();
             
-            const [duplicateAnalysis, classificationAnalysis, contextAnalysis] = await Promise.all([
+            const [duplicateAnalysis, classificationAnalysis, contextAnalysisResponse] = await Promise.all([
               // Call 1: Duplicate & Similar Issues Detection
               callLLM(
                 'You are a duplicate issue detector. Analyze if the new issue duplicates or relates to existing issues.',
@@ -116,17 +116,17 @@ jobs:
             
             // Parse responses
             console.log('\n[3/6] Parsing LLM responses...');
-            let dup, classify, context;
+            let dup, classify, contextAnalysis;
             try {
               dup = JSON.parse(duplicateAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
               classify = JSON.parse(classificationAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
-              context = JSON.parse(contextAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
+              contextAnalysis = JSON.parse(contextAnalysisResponse.match(/\{[\s\S]*\}/)?.[0] || '{}');
               console.log('✓ All responses parsed successfully');
             } catch (e) {
               console.log('✗ Parse error:', e.message);
               console.log('Duplicate response:', duplicateAnalysis);
               console.log('Classify response:', classificationAnalysis);
-              console.log('Context response:', contextAnalysis);
+              console.log('Context response:', contextAnalysisResponse);
               
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
@@ -139,7 +139,7 @@ jobs:
             
             console.log('Parsed duplicate:', JSON.stringify(dup, null, 2));
             console.log('Parsed classify:', JSON.stringify(classify, null, 2));
-            console.log('Parsed context:', JSON.stringify(context, null, 2));
+            console.log('Parsed context:', JSON.stringify(contextAnalysis, null, 2));
             
             // Build labels
             console.log('\n[4/6] Applying labels...');
@@ -148,7 +148,7 @@ jobs:
             if (classify.priority) labelsToAdd.push(classify.priority);
             if (classify.size) labelsToAdd.push(`size:${classify.size}`);
             if (classify.type) labelsToAdd.push(`type:${classify.type}`);
-            if (context.sentiment === 'frustrated' || context.sentiment === 'angry') {
+            if (contextAnalysis.sentiment === 'frustrated' || contextAnalysis.sentiment === 'angry') {
               labelsToAdd.push('needs-attention');
             }
             
@@ -179,7 +179,7 @@ jobs:
                 if (dup.mergeProposal) {
                   dupComment += `**Merge Proposal:** ${dup.mergeProposal}\n\n`;
                 }
-                dupComment += `**Reasoning:** ${context.reasoning || 'Detected as duplicate'}`;
+                dupComment += `**Reasoning:** ${contextAnalysis.reasoning || 'Detected as duplicate'}`;
                 
                 try {
                   await github.rest.issues.createComment({
@@ -259,31 +259,31 @@ jobs:
               commentBody += `### 📚 Historical Reference\nSimilar issue found: ${dup.historicalMatch}\n\n`;
             }
             
-            if (context.dependencies?.blocks?.length > 0 || context.dependencies?.blockedBy?.length > 0) {
+            if (contextAnalysis.dependencies?.blocks?.length > 0 || contextAnalysis.dependencies?.blockedBy?.length > 0) {
               commentBody += `### ⛓️ Dependencies\n`;
-              if (context.dependencies.blocks?.length > 0) commentBody += `- **Blocks:** ${context.dependencies.blocks.join(', ')}\n`;
-              if (context.dependencies.blockedBy?.length > 0) commentBody += `- **Blocked by:** ${context.dependencies.blockedBy.join(', ')}\n`;
+              if (contextAnalysis.dependencies.blocks?.length > 0) commentBody += `- **Blocks:** ${contextAnalysis.dependencies.blocks.join(', ')}\n`;
+              if (contextAnalysis.dependencies.blockedBy?.length > 0) commentBody += `- **Blocked by:** ${contextAnalysis.dependencies.blockedBy.join(', ')}\n`;
               commentBody += '\n';
             }
             
-            if (context.missingInfo?.length > 0) {
+            if (contextAnalysis.missingInfo?.length > 0) {
               commentBody += `### ⚠️ Missing Information\nPlease provide:\n`;
-              context.missingInfo.forEach(info => commentBody += `- ${info}\n`);
+              contextAnalysis.missingInfo.forEach(info => commentBody += `- ${info}\n`);
               commentBody += '\n';
             }
             
-            if (context.sentiment === 'frustrated' || context.sentiment === 'angry') {
-              commentBody += `### 🚨 Attention Required\nUser sentiment detected as **${context.sentiment}** - prioritize response!\n\n`;
+            if (contextAnalysis.sentiment === 'frustrated' || contextAnalysis.sentiment === 'angry') {
+              commentBody += `### 🚨 Attention Required\nUser sentiment detected as **${contextAnalysis.sentiment}** - prioritize response!\n\n`;
             }
             
-            if (context.isEpic && context.subIssueSuggestions?.length > 0) {
+            if (contextAnalysis.isEpic && contextAnalysis.subIssueSuggestions?.length > 0) {
               commentBody += `### 📋 Epic Breakdown Suggestion\nThis issue appears large. Consider breaking it into:\n`;
-              context.subIssueSuggestions.forEach((sub, i) => commentBody += `${i+1}. ${sub}\n`);
+              contextAnalysis.subIssueSuggestions.forEach((sub, i) => commentBody += `${i+1}. ${sub}\n`);
               commentBody += '\n';
             }
             
-            if (context.reasoning) {
-              commentBody += `### 💡 Analysis\n${context.reasoning}\n\n`;
+            if (contextAnalysis.reasoning) {
+              commentBody += `### 💡 Analysis\n${contextAnalysis.reasoning}\n\n`;
             }
             
             commentBody += `---\n*Analysis completed in ${Date.now() - startTime}ms*`;
