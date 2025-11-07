@@ -1,0 +1,70 @@
+name: Check for Duplicate Issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  check-duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for duplicates with LLM
+        uses: actions/github-script@v6
+        env:
+          MODELS_PAT: ${{ secrets.MODELS_PAT }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            // Prepare prompt for LLM
+            const openIssuesText = issues.filter(i => i.number !== issue.number).map(i => `Issue #${i.number}: ${i.title} - ${i.body?.substring(0,200) || 'No description'}`).join('\n');
+            const prompt = `New issue: ${issue.title} - ${issue.body || 'No description'}\n\nOpen issues:\n${openIssuesText}\n\nIs this new issue a near duplicate of any open issue? If yes, reply with the issue number (e.g., #123). If no, reply 'No duplicate'.`;
+            
+            // Call GitHub Models API (GPT-4o-mini)
+            const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${process.env.MODELS_PAT}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                model: 'gpt-4o-mini',
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 100
+              })
+            });
+            
+            if (!response.ok) {
+              console.log('LLM call failed:', response.status);
+              return;
+            }
+            
+            const result = await response.json();
+            const llmResponse = result.choices[0].message.content.trim();
+            
+            if (llmResponse.startsWith('#')) {
+              const dupNumber = llmResponse.match(/#(\d+)/)[1];
+              // Close the issue, add label, comment
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                labels: ['duplicate']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `This issue has been closed as a duplicate of #${dupNumber}.`
+              });
+            }
