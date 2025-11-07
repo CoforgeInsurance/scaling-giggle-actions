@@ -21,13 +21,13 @@ jobs:
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              state: 'open',
+              state: 'all',
               per_page: 100
             });
             
-            // Prepare prompt for LLM
-            const openIssuesText = issues.filter(i => i.number !== issue.number).map(i => `Issue #${i.number}: ${i.title} - ${i.body?.substring(0,200) || 'No description'}`).join('\n');
-            const prompt = `New issue: ${issue.title} - ${issue.body || 'No description'}\n\nOpen issues:\n${openIssuesText}\n\nIs this new issue a near duplicate of any open issue? If yes, reply with the issue number (e.g., #123). If no, reply 'No duplicate'.`;
+            // Prepare prompt for LLM - include all issues (open and closed)
+            const allIssuesText = issues.filter(i => i.number !== issue.number).map(i => `Issue #${i.number} [${i.state}]: ${i.title} - ${i.body?.substring(0,200) || 'No description'}`).join('\n\n');
+            const prompt = `You are a duplicate issue detector. Compare the new issue below with all existing issues.\n\nNew issue:\nTitle: ${issue.title}\nBody: ${issue.body || 'No description'}\n\nExisting issues:\n${allIssuesText}\n\nTask: Is this new issue a duplicate or near-duplicate of any existing issue (open or closed)?\nIf YES: Reply ONLY with the issue number in format "#123"\nIf NO: Reply ONLY with "No duplicate"\n\nYour answer:`;
             
             // Call GitHub Models API (GPT-4o-mini)
             const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
