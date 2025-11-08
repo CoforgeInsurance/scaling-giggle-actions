@@ -71,7 +71,7 @@ jobs:
             console.log('\n[2/6] Running parallel LLM analysis...');
             const llmStart = Date.now();
             
-            const [duplicateAnalysis, classificationAnalysis, contextAnalysisResponse] = await Promise.all([
+            const [duplicateAnalysis, classificationAnalysis, contextAnalysisResponse, spanishTranslation] = await Promise.all([
               // Call 1: Duplicate & Similar Issues Detection
               callLLM(
                 'You are a duplicate issue detector. Analyze if the new issue duplicates or relates to existing issues.',
@@ -109,6 +109,19 @@ jobs:
               }).catch(e => {
                 console.log('✗ Context analysis failed:', e.message);
                 return '{"sentiment": "neutral", "missingInfo": [], "isEpic": false, "subIssueSuggestions": [], "dependencies": null, "reasoning": "Analysis failed"}';
+              }),
+              
+              // Call 4: Spanish Translation
+              callLLM(
+                'You are a professional translator. Translate GitHub issues to Spanish.',
+                `Translate this issue to Spanish:\n\nTitle: ${issue.title}\n\nBody:\n${issue.body || 'No description'}\n\nRespond in JSON:\n{\n  "title": "translated title",\n  "body": "translated body"\n}`,
+                400
+              ).then(resp => {
+                console.log('✓ Spanish translation completed');
+                return resp;
+              }).catch(e => {
+                console.log('✗ Spanish translation failed:', e.message);
+                return '{"title": "Translation failed", "body": "Translation failed"}';
               })
             ]);
             
@@ -116,17 +129,19 @@ jobs:
             
             // Parse responses
             console.log('\n[3/6] Parsing LLM responses...');
-            let dup, classify, contextAnalysis;
+            let dup, classify, contextAnalysis, translation;
             try {
               dup = JSON.parse(duplicateAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
               classify = JSON.parse(classificationAnalysis.match(/\{[\s\S]*\}/)?.[0] || '{}');
               contextAnalysis = JSON.parse(contextAnalysisResponse.match(/\{[\s\S]*\}/)?.[0] || '{}');
+              translation = JSON.parse(spanishTranslation.match(/\{[\s\S]*\}/)?.[0] || '{}');
               console.log('✓ All responses parsed successfully');
             } catch (e) {
               console.log('✗ Parse error:', e.message);
               console.log('Duplicate response:', duplicateAnalysis);
               console.log('Classify response:', classificationAnalysis);
               console.log('Context response:', contextAnalysisResponse);
+              console.log('Translation response:', spanishTranslation);
               
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
@@ -140,6 +155,7 @@ jobs:
             console.log('Parsed duplicate:', JSON.stringify(dup, null, 2));
             console.log('Parsed classify:', JSON.stringify(classify, null, 2));
             console.log('Parsed context:', JSON.stringify(contextAnalysis, null, 2));
+            console.log('Parsed translation:', JSON.stringify(translation, null, 2));
             
             // Build labels
             console.log('\n[4/6] Applying labels...');
@@ -284,6 +300,13 @@ jobs:
             
             if (contextAnalysis.reasoning) {
               commentBody += `### 💡 Analysis\n${contextAnalysis.reasoning}\n\n`;
+            }
+            
+            // Add Spanish translation
+            if (translation.title && translation.body) {
+              commentBody += `### 🌐 Spanish Translation / Traducción al Español\n\n`;
+              commentBody += `**Título:** ${translation.title}\n\n`;
+              commentBody += `**Descripción:**\n${translation.body}\n\n`;
             }
             
             commentBody += `---\n*Analysis completed in ${Date.now() - startTime}ms*`;
